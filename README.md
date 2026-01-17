@@ -7,25 +7,6 @@ Evaluation is provided on:
 1) a held-out **validation split** of the dataset  
 2) **external real videos** (internet videos, 3–5+) via an inference script
 
----
-
-## Task Requirements Checklist
-
-- ✅ PyTorch model trained on `real-life-violence-situations-dataset`
-- ✅ Target accuracy **85%+** achieved (Validation accuracy **97.75%**)
-- ✅ Final weights exported as **`.safetensors`**
-- ✅ Accuracy checked on:
-  - ✅ validation split of the dataset
-  - ✅ external videos (3–5+) using `infer.py`
-- ✅ GitHub repo contains:
-  - training code
-  - evaluation code
-  - inference code
-  - README with implementation details
-  - final model weights (`.safetensors`)
-  - base model used for fine-tuning (pretrained `r2plus1d_18` from torchvision)
-
----
 
 ## Dataset
 
@@ -194,3 +175,4 @@ Use Git LFS or
 
 
 upload the model via GitHub Releases and link it in this README.
+
