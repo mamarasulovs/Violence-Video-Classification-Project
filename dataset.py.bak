@@ -1,0 +1,184 @@
+import csv
+import random
+from dataclasses import dataclass
+from typing import List, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms.functional as TF
+
+# Optional decord (fast). If unavailable, fallback to OpenCV.
+try:
+    import decord
+    decord.bridge.set_bridge("native")
+    HAS_DECORD = True
+except Exception:
+    HAS_DECORD = False
+
+try:
+    import cv2
+    HAS_CV2 = True
+except Exception:
+    HAS_CV2 = False
+
+
+@dataclass
+class VideoConfig:
+    num_frames: int = 16
+    resize_short: int = 256
+    crop_size: int = 224
+    mean: Tuple[float, float, float] = (0.45, 0.45, 0.45)
+    std: Tuple[float, float, float] = (0.225, 0.225, 0.225)
+
+
+def _read_video_decord(path: str) -> np.ndarray:
+    vr = decord.VideoReader(path)
+    n = len(vr)
+    frames = vr.get_batch(list(range(n))).asnumpy()  # (N,H,W,3) RGB
+    return frames
+
+
+def _read_video_opencv(path: str) -> np.ndarray:
+    if not HAS_CV2:
+        raise RuntimeError("OpenCV (cv2) is not installed and decord is unavailable.")
+    cap = cv2.VideoCapture(path)
+    frames = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+    cap.release()
+    if len(frames) == 0:
+        raise RuntimeError(f"Could not read video (0 frames): {path}")
+    return np.stack(frames, axis=0)
+
+
+def read_video(path: str) -> np.ndarray:
+    if HAS_DECORD:
+        try:
+            return _read_video_decord(path)
+        except Exception:
+            return _read_video_opencv(path)
+    return _read_video_opencv(path)
+
+
+def sample_indices(num_total: int, num_frames: int, train: bool, rng: random.Random) -> List[int]:
+    if num_total <= 0:
+        return [0] * num_frames
+
+    if num_total < num_frames:
+        idx = list(range(num_total))
+        while len(idx) < num_frames:
+            idx += idx
+        return idx[:num_frames]
+
+    base = np.linspace(0, num_total - 1, num_frames).astype(int)
+
+    # Small temporal jitter for training to reduce overfitting
+    if train:
+        jitter = rng.randint(-2, 2)
+        base = np.clip(base + jitter, 0, num_total - 1)
+
+    return base.tolist()
+
+
+def resize_short_side(frames: torch.Tensor, short: int) -> torch.Tensor:
+    # frames: (T,C,H,W)
+    T, C, H, W = frames.shape
+    if H < W:
+        new_h = short
+        new_w = int(round(W * (short / H)))
+    else:
+        new_w = short
+        new_h = int(round(H * (short / W)))
+
+    out = []
+    for t in range(T):
+        out.append(TF.resize(frames[t], [new_h, new_w], antialias=True))
+    return torch.stack(out, dim=0)
+
+
+def center_crop(frames: torch.Tensor, size: int) -> torch.Tensor:
+    out = []
+    for t in range(frames.shape[0]):
+        out.append(TF.center_crop(frames[t], [size, size]))
+    return torch.stack(out, dim=0)
+
+
+def random_resized_crop(frames: torch.Tensor, size: int, rng: random.Random) -> torch.Tensor:
+    # One crop params for all frames
+    T, C, H, W = frames.shape
+    area = H * W
+
+    for _ in range(10):
+        target_area = area * rng.uniform(0.6, 1.0)
+        aspect = rng.uniform(0.75, 1.333)
+
+        crop_w = int(round((target_area * aspect) ** 0.5))
+        crop_h = int(round((target_area / aspect) ** 0.5))
+
+        if 0 < crop_h <= H and 0 < crop_w <= W:
+            i = rng.randint(0, H - crop_h)
+            j = rng.randint(0, W - crop_w)
+            out = []
+            for t in range(T):
+                out.append(TF.resized_crop(frames[t], i, j, crop_h, crop_w, [size, size], antialias=True))
+            return torch.stack(out, dim=0)
+
+    return center_crop(frames, size)
+
+
+class ViolenceVideoDataset(Dataset):
+    def __init__(self, splits_csv: str, split: str, cfg: VideoConfig, seed: int = 42):
+        self.cfg = cfg
+        self.split = split
+        self.seed = seed
+        self.items: List[Tuple[str, int]] = []
+
+        with open(splits_csv, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if row["split"] == split:
+                    self.items.append((row["path"], int(row["label"])))
+
+        if not self.items:
+            raise RuntimeError(f"No items for split='{split}' in {splits_csv}")
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        path, label = self.items[idx]
+        rng = random.Random(self.seed + idx)
+
+        frames_np = read_video(path)  # (N,H,W,3) RGB
+        n = frames_np.shape[0]
+
+        inds = sample_indices(n, self.cfg.num_frames, train=(self.split == "train"), rng=rng)
+        clip = frames_np[inds]  # (T,H,W,3)
+
+        # (T,3,H,W) float in [0,1]
+        clip = torch.from_numpy(clip).to(torch.uint8)
+        clip = clip.permute(0, 3, 1, 2).contiguous()
+        clip = clip.float() / 255.0
+
+        clip = resize_short_side(clip, self.cfg.resize_short)
+
+        if self.split == "train":
+            clip = random_resized_crop(clip, self.cfg.crop_size, rng)
+            if rng.random() < 0.5:
+                clip = torch.flip(clip, dims=[3])
+        else:
+            clip = center_crop(clip, self.cfg.crop_size)
+
+        mean = torch.tensor(self.cfg.mean).view(1, 3, 1, 1)
+        std = torch.tensor(self.cfg.std).view(1, 3, 1, 1)
+        clip = (clip - mean) / std
+
+        # Return (C,T,H,W) for torchvision video models
+        clip = clip.permute(1, 0, 2, 3).contiguous()
+
+        return clip, torch.tensor(label, dtype=torch.long), path
